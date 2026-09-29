@@ -1,6 +1,42 @@
 {% extends "base.html" %}
 
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  .register-content { max-width: 760px; }
+  .search-controls { position: relative; z-index: 500; max-width: 620px; }
+  .map-search { display: flex; gap: 8px; max-width: 620px; }
+  .map-search input { flex: 1; min-width: 0; }
+  #placeMap { width: 100%; height: 360px; margin-top: 14px; background: #edf1ef; }
+  #placeResults {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    width: 100%;
+    max-height: 280px;
+    overflow-y: auto;
+    margin: 4px 0 0;
+    padding: 4px 0;
+    border: 1px solid #c8d0cc;
+    background: #fff;
+    box-shadow: 0 5px 14px rgb(25 45 37 / 16%);
+    list-style: none;
+  }
+  #placeResults:not(:empty) { display: block; }
+  #placeResults li + li { margin-top: 6px; }
+  #placeResults button { width: 100%; padding: 10px 12px; text-align: left; }
+  #placeStatus { min-height: 1.5em; }
+  .map-credit { font-size: 12px; color: #52615b; }
+  @media (max-width: 600px) {
+    #placeMap { height: 310px; }
+    .map-search { align-items: stretch; }
+  }
+</style>
+{% endblock %}
+
 {% block content %}
+<div class="register-content">
 <h2>避難所登録</h2>
 <p>新しい避難所情報を登録します。</p>
 
@@ -15,9 +51,182 @@
 
 <form method="POST">
   <p>
-    <label for="name">避難所名（必須）</label><br>
-    <input type="text" id="name" name="name">
+    <label for="place-query">地図から場所を検索</label><br>
   </p>
-  <p><button type="submit">登録</button></p>
+  <div class="search-controls">
+    <div class="map-search">
+      <input type="search" id="place-query" autocomplete="off" placeholder="施設名・地名・住所を入力" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="placeResults">
+      <button type="button" id="place-search-button">検索</button>
+    </div>
+    <ul id="placeResults" role="listbox" aria-label="場所の候補"></ul>
+  </div>
+  <p id="placeStatus" role="status" aria-live="polite"></p>
+  <div id="placeMap" aria-label="検索した場所の地図"></div>
+  <p class="map-credit">地図データ: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a> / 検索: <a href="https://photon.komoot.io/" target="_blank" rel="noopener noreferrer">Photon</a></p>
+  <p>
+    <label for="name">避難所名（必須）</label><br>
+    <input type="text" id="name" name="name" required pattern=".*\S.*" readonly>
+  </p>
+  <p>
+    <label for="district">地区名（必須）</label><br>
+    <input type="text" id="district" name="district" required maxlength="80" placeholder="例: 片瀬地区">
+    <small>候補に地区名がない場合は、正しい地区名を入力してください。</small>
+  </p>
+  <input type="hidden" id="osm-type" name="osm_type">
+  <input type="hidden" id="osm-id" name="osm_id">
+  <p><button type="submit" id="register-button" disabled>登録</button></p>
 </form>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const searchInput = document.getElementById('place-query');
+  const searchButton = document.getElementById('place-search-button');
+  const resultsList = document.getElementById('placeResults');
+  const status = document.getElementById('placeStatus');
+  const nameInput = document.getElementById('name');
+  const districtInput = document.getElementById('district');
+  const osmTypeInput = document.getElementById('osm-type');
+  const osmIdInput = document.getElementById('osm-id');
+  const registerButton = document.getElementById('register-button');
+  let map;
+  let marker;
+  let suggestionTimer;
+  let searchSequence = 0;
+
+  if (window.L) {
+    map = L.map('placeMap').setView([40.8222, 140.7474], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+      referrerPolicy: 'strict-origin-when-cross-origin'
+    }).addTo(map);
+  } else {
+    status.textContent = '地図を読み込めませんでした。ページを再読み込みしてください。';
+  }
+
+  function clearSuggestions() {
+    resultsList.replaceChildren();
+    searchInput.setAttribute('aria-expanded', 'false');
+  }
+
+  function searchPlaces(useSuggestions = false, query = searchInput.value.trim()) {
+    const minimumLength = useSuggestions ? 1 : 2;
+    if (query.length < minimumLength) {
+      status.textContent = useSuggestions
+        ? '1文字以上入力してください。'
+        : '施設名または住所を2文字以上入力してください。';
+      return;
+    }
+
+    const requestSequence = ++searchSequence;
+    if (!useSuggestions) searchButton.disabled = true;
+    status.textContent = useSuggestions ? '候補を検索しています...' : '地図を検索しています...';
+    const endpoint = useSuggestions ? '/api/place_suggestions' : '/api/map_places';
+    fetch(`${endpoint}?q=${encodeURIComponent(query)}`)
+      .then(async response => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '地図検索に失敗しました。');
+        return data;
+      })
+      .then(places => {
+        if (requestSequence !== searchSequence) return;
+        if (places.length === 0) {
+          status.textContent = '地図上に候補が見つかりませんでした。';
+          return;
+        }
+        status.textContent = useSuggestions ? '' : '候補を選択してください。';
+        searchInput.setAttribute('aria-expanded', 'true');
+        places.forEach(place => {
+          const item = document.createElement('li');
+          item.setAttribute('role', 'presentation');
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.setAttribute('role', 'option');
+          button.textContent = place.display_name;
+          button.addEventListener('click', () => {
+            clearTimeout(suggestionTimer);
+            searchSequence += 1;
+            osmTypeInput.value = place.osm_type[0].toUpperCase();
+            osmIdInput.value = place.osm_id;
+            nameInput.value = place.name;
+            districtInput.value = place.district || '';
+            searchInput.value = place.name;
+            clearSuggestions();
+            registerButton.disabled = false;
+            const position = [Number(place.latitude), Number(place.longitude)];
+            if (map && position.every(Number.isFinite)) {
+              map.setView(position, 16);
+              if (marker) marker.setLatLng(position);
+              else marker = L.marker(position).addTo(map);
+            }
+            status.textContent = `選択中: ${place.display_name}`;
+          });
+          item.append(button);
+          resultsList.append(item);
+        });
+      })
+      .catch(error => {
+        if (requestSequence !== searchSequence) return;
+        status.textContent = error.message || '地図検索に接続できませんでした。';
+      })
+      .finally(() => {
+        if (requestSequence === searchSequence && !useSuggestions) {
+          searchButton.disabled = false;
+        }
+      });
+  }
+
+  function queueSuggestions() {
+    clearTimeout(suggestionTimer);
+    searchSequence += 1;
+    clearSuggestions();
+    osmTypeInput.value = '';
+    osmIdInput.value = '';
+    nameInput.value = '';
+    districtInput.value = '';
+    registerButton.disabled = true;
+
+    const query = searchInput.value.trim();
+    if (query.length < 1) {
+      status.textContent = '';
+      return;
+    }
+
+    status.textContent = '候補を検索しています...';
+    suggestionTimer = setTimeout(() => searchPlaces(true, query), 300);
+  }
+
+  searchInput.addEventListener('input', queueSuggestions);
+  searchInput.addEventListener('compositionupdate', queueSuggestions);
+
+  searchButton.addEventListener('click', () => {
+    clearTimeout(suggestionTimer);
+    searchPlaces();
+  });
+  searchInput.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') {
+      const firstSuggestion = resultsList.querySelector('button');
+      if (firstSuggestion) {
+        event.preventDefault();
+        firstSuggestion.focus();
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      clearTimeout(suggestionTimer);
+      searchSequence += 1;
+      clearSuggestions();
+      status.textContent = '';
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const firstSuggestion = resultsList.querySelector('button');
+      if (firstSuggestion) firstSuggestion.click();
+      else {
+        clearTimeout(suggestionTimer);
+        searchPlaces();
+      }
+    }
+  });
+</script>
 {% endblock %}

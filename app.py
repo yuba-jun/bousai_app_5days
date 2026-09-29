@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template, session, redirect, url_for
+from flask import Flask, abort, jsonify, request, render_template, session, redirect, url_for
 from urllib.parse import urlparse, urljoin
 from functools import wraps
 import json
@@ -28,8 +28,8 @@ ADMIN_CREDENTIALS = {
 PREFECTURE_CODE = "020000"  # 青森県
 AREA_NAME = "青森市"
 
-# ワークショップ課題：青森市の市区町村コードに変更する
-AREA_CODE = "1420500"
+# 青森市の市区町村コード
+AREA_CODE = "0220100"
 
 WARNING_URL = (
     f"https://www.jma.go.jp/bosai/warning/data/r8/{PREFECTURE_CODE}.json"
@@ -139,9 +139,58 @@ def format_report_time(iso_str):
         return iso_str
 
 
-def filter_shelters(district=None):
-    """district 指定があれば一致する避難所のみ、なければ全件を返す"""
-    return [s for s in shelters if not district or s.get('district') == district]
+def has_valid_shelter_location(shelter):
+    try:
+        latitude = float(shelter.get('latitude'))
+        longitude = float(shelter.get('longitude'))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return -90 <= latitude <= 90 and -180 <= longitude <= 180
+
+
+def filter_shelters(district=None, include_unlocated=False):
+    """検索対象名と district 条件に一致する避難所を返す"""
+    excluded_names = {'a', 'あ', 'yugvb'}
+    return [
+        shelter for shelter in shelters
+        if str(shelter.get('name', '')).strip().casefold() not in excluded_names
+        and (include_unlocated or has_valid_shelter_location(shelter))
+        and (not district or shelter.get('district') == district)
+    ]
+
+
+def search_shelters(query=None):
+    results = filter_shelters(include_unlocated=True)
+    query = (query or '').strip().casefold()
+    if not query:
+        return results
+    return [
+        shelter for shelter in results
+        if query in shelter.get('name', '').casefold()
+        or query in shelter.get('city', '').casefold()
+        or query in shelter.get('district', '').casefold()
+    ]
+
+
+def group_shelters_by_district(results):
+    grouped = {}
+    for shelter in results:
+        district = shelter.get('district') or '地区未設定'
+        grouped.setdefault(district, []).append(shelter)
+    return sorted(grouped.items())
+
+
+def request_map_places(url):
+    """OpenStreetMap の地物情報を取得する"""
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': 'BousaiApp/1.0 (shelter registration)',
+            'Accept-Language': 'ja'
+        }
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.loads(response.read())
 
 
 def parse_area_warnings(warning_data):
@@ -237,7 +286,12 @@ def get_weather_warnings():
 @app.route('/')
 def index():
     resident_notices = [i for i in instructions if i.get('target') == '住民']
-    return render_template('index.html', resident_notices=resident_notices)
+    return render_template(
+        'index.html',
+        resident_notices=resident_notices,
+        shelters=shelters,
+        selected_shelter_id=request.args.get('shelter_id')
+    )
 
 # ログインページ
 @app.route('/login', methods=['GET', 'POST'])
@@ -278,20 +332,315 @@ def logout():
     return redirect(url_for('index'))
 
 # 避難所登録ページ※user が避難所登録ページについて具体的に修正指示しない限り、このコードは正しいのでこのまま保持すること。
-@app.route('/shelter_register')
+@app.route('/shelter_register', methods=['GET', 'POST'])
 @login_required
 def shelter_register():
+    if request.method == 'POST':
+        osm_type = request.form.get('osm_type', '').strip().upper()
+        osm_id = request.form.get('osm_id', '').strip()
+        district = request.form.get('district', '').strip()
+        if osm_type not in ('N', 'W', 'R') or not osm_id.isdigit():
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message='地図上の場所を検索して選択してください。'
+            )
+
+        try:
+            osm_types = {'N': 'node', 'W': 'way', 'R': 'relation'}
+            places = request_map_places(
+                'https://nominatim.openstreetmap.org/lookup?'
+                f'osm_ids={osm_type}{osm_id}&format=jsonv2&addressdetails=1'
+            )
+            place = places[0] if places else None
+            if (
+                not place
+                or place.get('osm_type') != osm_types[osm_type]
+                or str(place.get('osm_id')) != osm_id
+            ):
+                raise ValueError('Map place was not found')
+            name = (place.get('name') or place.get('display_name', '')).strip()
+            if not name:
+                raise ValueError('Map place has no name')
+            latitude = float(place['lat'])
+            longitude = float(place['lon'])
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                raise ValueError('Invalid map coordinates')
+            address = place.get('address', {})
+            city = next((
+                address.get(key) for key in ('city', 'municipality', 'town', 'village', 'county')
+                if address.get(key)
+            ), '')
+            if not district:
+                district = next((
+                    address.get(key) for key in ('city_district', 'district')
+                    if address.get(key)
+                ), '')
+            if not district:
+                raise ValueError('District is required')
+        except (KeyError, TypeError, ValueError, IndexError, OSError, json.JSONDecodeError):
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message='地区名と地図上の場所を確認してください。'
+            )
+
+        if any(
+            item.get('name', '').strip().casefold() == name.casefold()
+            for item in shelters
+        ):
+            return render_template(
+                'shelter_register.html',
+                error=True,
+                message='この避難所はすでに登録されています。'
+            )
+
+        shelter = {
+            'id': max((item.get('id', 0) for item in shelters), default=0) + 1,
+            'name': name,
+            'city': city,
+            'district': district,
+            'latitude': latitude,
+            'longitude': longitude,
+            'osm_type': osm_type,
+            'osm_id': int(osm_id)
+        }
+        shelters.append(shelter)
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(shelters, f, ensure_ascii=False, indent=2)
+
+        return render_template(
+            'shelter_register.html',
+            success=True,
+            message='新しい避難所が登録できました。'
+        )
+
     return render_template('shelter_register.html')
+
+
+@app.route('/shelter_location/<int:shelter_id>', methods=['GET', 'POST'])
+@login_required
+def shelter_location(shelter_id):
+    shelter = next((item for item in shelters if item.get('id') == shelter_id), None)
+    if shelter is None:
+        abort(404)
+
+    if request.method == 'POST':
+        osm_type = request.form.get('osm_type', '').strip().upper()
+        osm_id = request.form.get('osm_id', '').strip()
+        if osm_type not in ('N', 'W', 'R') or not osm_id.isdigit():
+            return render_template(
+                'shelter_location.html',
+                shelter=shelter,
+                error='地図上の候補を選択してください。'
+            )
+
+        try:
+            osm_types = {'N': 'node', 'W': 'way', 'R': 'relation'}
+            places = request_map_places(
+                'https://nominatim.openstreetmap.org/lookup?'
+                f'osm_ids={osm_type}{osm_id}&format=jsonv2'
+            )
+            place = places[0] if places else None
+            if (
+                not place
+                or place.get('osm_type') != osm_types[osm_type]
+                or str(place.get('osm_id')) != osm_id
+            ):
+                raise ValueError('Map place was not found')
+            latitude = float(place['lat'])
+            longitude = float(place['lon'])
+            if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+                raise ValueError('Invalid map coordinates')
+        except (KeyError, TypeError, ValueError, IndexError, OSError, json.JSONDecodeError):
+            return render_template(
+                'shelter_location.html',
+                shelter=shelter,
+                error='選択した場所を確認できませんでした。もう一度検索してください。'
+            )
+
+        shelter.update({
+            'latitude': latitude,
+            'longitude': longitude,
+            'osm_type': osm_type,
+            'osm_id': int(osm_id)
+        })
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(shelters, f, ensure_ascii=False, indent=2)
+
+        return redirect(url_for('index', shelter_id=shelter_id) + '#shelterMap')
+
+    return render_template('shelter_location.html', shelter=shelter)
+
+
+@app.route('/api/map_places')
+@login_required
+def search_map_places():
+    query = request.args.get('q', '').strip()
+    if len(query) < 2:
+        return jsonify({'error': '検索語を2文字以上入力してください。'}), 400
+
+    try:
+        places = request_map_places(
+            'https://nominatim.openstreetmap.org/search?'
+            f'q={urllib.parse.quote(query)}&format=jsonv2&limit=10&countrycodes=jp'
+        )
+    except (OSError, json.JSONDecodeError):
+        return jsonify({'error': '地図検索に接続できませんでした。'}), 503
+
+    return jsonify([
+        {
+            'osm_type': place['osm_type'],
+            'osm_id': place['osm_id'],
+            'name': place.get('name') or place.get('display_name', ''),
+            'display_name': place.get('display_name', ''),
+            'latitude': place['lat'],
+            'longitude': place['lon']
+        }
+        for place in places
+        if place.get('osm_type') in ('node', 'way', 'relation')
+        and place.get('osm_id')
+        and place.get('lat') is not None
+        and place.get('lon') is not None
+    ])
+
+
+@app.route('/api/shelter_map_candidates/<int:shelter_id>')
+def shelter_map_candidates(shelter_id):
+    shelter = next((item for item in shelters if item.get('id') == shelter_id), None)
+    if shelter is None:
+        return jsonify({'error': 'Shelter not found'}), 404
+
+    try:
+        result = request_map_places(
+            'https://photon.komoot.io/api/?'
+            + urllib.parse.urlencode({'q': shelter.get('name', ''), 'limit': 8})
+        )
+    except (OSError, json.JSONDecodeError):
+        return jsonify({'error': '地図検索に接続できませんでした。'}), 503
+
+    osm_types = {
+        'N': 'node', 'W': 'way', 'R': 'relation',
+        'NODE': 'node', 'WAY': 'way', 'RELATION': 'relation'
+    }
+    candidates = []
+    for feature in result.get('features', []):
+        properties = feature.get('properties', {})
+        coordinates = feature.get('geometry', {}).get('coordinates', [])
+        osm_type = osm_types.get(str(properties.get('osm_type', '')).upper())
+        osm_id = properties.get('osm_id')
+        if not osm_type or not osm_id or not isinstance(coordinates, list) or len(coordinates) < 2:
+            continue
+        try:
+            latitude = float(coordinates[1])
+            longitude = float(coordinates[0])
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            continue
+
+        location_parts = [properties.get('name') or properties.get('street') or shelter['name']]
+        for part in ('district', 'city', 'state', 'country'):
+            value = properties.get(part)
+            if value and value not in location_parts:
+                location_parts.append(value)
+        candidates.append({
+            'osm_type': osm_type,
+            'osm_id': osm_id,
+            'display_name': ', '.join(location_parts),
+            'latitude': latitude,
+            'longitude': longitude
+        })
+
+    return jsonify(candidates)
+
+
+@app.route('/api/place_suggestions')
+@login_required
+def suggest_map_places():
+    query = request.args.get('q', '').strip()
+    if len(query) < 1:
+        return jsonify({'error': '検索語を入力してください。'}), 400
+
+    try:
+        result = request_map_places(
+            'https://photon.komoot.io/api/?'
+            f'q={urllib.parse.quote(query)}&limit=8&lat=40.8222&lon=140.7474'
+        )
+        features = result.get('features', [])
+    except (AttributeError, OSError, json.JSONDecodeError):
+        return jsonify({'error': '候補を検索できませんでした。'}), 503
+
+    osm_types = {
+        'N': 'node', 'W': 'way', 'R': 'relation',
+        'NODE': 'node', 'WAY': 'way', 'RELATION': 'relation'
+    }
+    suggestions = []
+    for feature in features:
+        properties = feature.get('properties', {})
+        coordinates = feature.get('geometry', {}).get('coordinates', [])
+        osm_type = osm_types.get(str(properties.get('osm_type', '')).upper())
+        osm_id = properties.get('osm_id')
+        name = properties.get('name') or properties.get('street')
+        if (
+            not osm_type or not osm_id or not name
+            or not isinstance(coordinates, list) or len(coordinates) < 2
+        ):
+            continue
+
+        location_parts = [name]
+        for part in ('district', 'city', 'state', 'country'):
+            value = properties.get(part)
+            if value and value not in location_parts:
+                location_parts.append(value)
+
+        suggestions.append({
+            'osm_type': osm_type,
+            'osm_id': osm_id,
+            'name': name,
+            'district': properties.get('district', ''),
+            'display_name': ', '.join(location_parts),
+            'latitude': coordinates[1],
+            'longitude': coordinates[0]
+        })
+
+    return jsonify(suggestions)
 
 # 避難所検索ページ
 @app.route('/shelter_search')
 def shelter_search():
-    return render_template('shelter_search.html')
+    results = filter_shelters(include_unlocated=True)
+    return render_template(
+        'shelter_search.html',
+        district_groups=group_shelters_by_district(results)
+    )
 
 # 全施設一覧ページ
 @app.route('/all_shelters')
 def all_shelters():
-    return render_template('search_results.html', results=shelters)
+    results = filter_shelters(include_unlocated=True)
+    return render_template(
+        'search_results.html',
+        results=results,
+        district_groups=group_shelters_by_district(results),
+        query=''
+    )
+
+
+@app.route('/shelter_district/<int:shelter_id>', methods=['POST'])
+@login_required
+def update_shelter_district(shelter_id):
+    shelter = next((item for item in shelters if item.get('id') == shelter_id), None)
+    if shelter is None:
+        abort(404)
+    district = request.form.get('district', '').strip()
+    if not district:
+        abort(400)
+
+    shelter['district'] = district
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(shelters, f, ensure_ascii=False, indent=2)
+    return redirect(url_for('search_results'))
 
 
 # 指示ボード：住民向けの指示を一覧で確認する
@@ -304,8 +653,18 @@ def board():
 # 検索結果ページ：templates/search_results.html を返す
 @app.route('/search_results')
 def search_results():
-    results = filter_shelters(request.args.get('district'))
-    return render_template('search_results.html', results=results)
+    query = request.args.get('q', '').strip()
+    results = (
+        search_shelters(query)
+        if query
+        else filter_shelters(request.args.get('district'), include_unlocated=True)
+    )
+    return render_template(
+        'search_results.html',
+        results=results,
+        district_groups=group_shelters_by_district(results),
+        query=query
+    )
 
 # JSON API：/shelters?district=地区名
 @app.route('/shelters', methods=['GET'])

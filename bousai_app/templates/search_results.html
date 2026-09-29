@@ -3,12 +3,34 @@
 {% block content %}
 <h2>検索結果</h2>
 
+<form action="/search_results" method="get">
+  <label for="shelter-query">地区名・市名または避難所名</label>
+  <div>
+    <input type="search" id="shelter-query" name="q" value="{{ query }}" placeholder="例: 片瀬地区、藤沢市、片瀬小学校">
+    <button type="submit">検索</button>
+  </div>
+</form>
+
 {% if results %}
-  <ul>
-    {% for shelter in results %}
-    <li>{{ shelter.name }}</li>
-    {% endfor %}
-  </ul>
+  {% for district, district_shelters in district_groups %}
+    <section aria-labelledby="district-{{ loop.index }}">
+      <h3 id="district-{{ loop.index }}">{{ district }}</h3>
+      <ul>
+        {% for shelter in district_shelters %}
+          <li><a href="{{ url_for('index', shelter_id=shelter.id) }}#shelterMap">{{ shelter.name }}</a></li>
+          {% if session.logged_in and not shelter.district %}
+            <li>
+              <form action="{{ url_for('update_shelter_district', shelter_id=shelter.id) }}" method="post">
+                <label for="district-{{ shelter.id }}">{{ shelter.name }}の地区</label>
+                <input type="text" id="district-{{ shelter.id }}" name="district" required maxlength="80" placeholder="例: 片瀬地区">
+                <button type="submit">地区を保存</button>
+              </form>
+            </li>
+          {% endif %}
+        {% endfor %}
+      </ul>
+    </section>
+  {% endfor %}
 {% else %}
   <p>該当する避難所が見つかりませんでした</p>
 {% endif %}

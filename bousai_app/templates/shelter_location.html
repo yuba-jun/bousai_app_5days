@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}避難所の位置設定 | 防災アプリ{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  .location-content { max-width: 760px; }
+  .location-search { display: flex; gap: 8px; max-width: 620px; }
+  .location-search input { flex: 1; min-width: 0; }
+  #locationMap { width: 100%; height: 360px; margin-top: 14px; background: #edf1ef; }
+  #locationResults { max-width: 620px; margin: 8px 0; padding-left: 22px; }
+  #locationResults button { text-align: left; }
+  #locationStatus { min-height: 1.5em; }
+  @media (max-width: 600px) {
+    #locationMap { height: 310px; }
+    .location-search { align-items: stretch; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="location-content">
+  <h1>{{ shelter.name }} の位置設定</h1>
+  {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+  <label for="location-query">施設名・住所で場所を検索</label>
+  <div class="location-search">
+    <input type="search" id="location-query" value="{{ shelter.name }}" autocomplete="off">
+    <button type="button" id="location-search-button">検索</button>
+  </div>
+  <p id="locationStatus" role="status" aria-live="polite"></p>
+  <ul id="locationResults" aria-label="地図の候補"></ul>
+  <div id="locationMap" aria-label="選択した候補の地図"></div>
+
+  <form method="post" id="location-form">
+    <input type="hidden" name="osm_type" id="osm-type">
+    <input type="hidden" name="osm_id" id="osm-id">
+    <p><button type="submit" id="save-location" disabled>この場所を保存</button></p>
+  </form>
+  <p><a href="{{ url_for('index', shelter_id=shelter.id) }}#shelterMap">地図に戻る</a></p>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const queryInput = document.getElementById('location-query');
+  const searchButton = document.getElementById('location-search-button');
+  const results = document.getElementById('locationResults');
+  const status = document.getElementById('locationStatus');
+  const osmTypeInput = document.getElementById('osm-type');
+  const osmIdInput = document.getElementById('osm-id');
+  const saveButton = document.getElementById('save-location');
+  let map;
+  let marker;
+
+  if (window.L) {
+    map = L.map('locationMap').setView([40.8222, 140.7474], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+      referrerPolicy: 'strict-origin-when-cross-origin'
+    }).addTo(map);
+  } else {
+    status.textContent = '地図を読み込めませんでした。ページを再読み込みしてください。';
+    return;
+  }
+
+  searchButton.addEventListener('click', async function() {
+    const query = queryInput.value.trim();
+    if (query.length < 2) {
+      status.textContent = '施設名または住所を2文字以上入力してください。';
+      return;
+    }
+
+    searchButton.disabled = true;
+    results.replaceChildren();
+    status.textContent = '地図を検索しています...';
+    try {
+      const response = await fetch(`/api/map_places?q=${encodeURIComponent(query)}`);
+      const places = await response.json();
+      if (!response.ok) throw new Error(places.error || '地図検索に失敗しました。');
+      if (places.length === 0) {
+        status.textContent = '候補が見つかりませんでした。住所を加えて再検索してください。';
+        return;
+      }
+
+      status.textContent = '該当する場所を選択してください。';
+      places.forEach(place => {
+        const item = document.createElement('li');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = place.display_name;
+        button.addEventListener('click', function() {
+          const position = [Number(place.latitude), Number(place.longitude)];
+          if (!position.every(Number.isFinite)) return;
+          osmTypeInput.value = place.osm_type[0].toUpperCase();
+          osmIdInput.value = place.osm_id;
+          saveButton.disabled = false;
+          map.setView(position, 17);
+          if (marker) marker.setLatLng(position);
+          else marker = L.marker(position).addTo(map);
+          status.textContent = `選択中: ${place.display_name}`;
+        });
+        item.append(button);
+        results.append(item);
+      });
+    } catch (error) {
+      status.textContent = error.message || '地図検索に接続できませんでした。';
+    } finally {
+      searchButton.disabled = false;
+    }
+  });
+});
+</script>
+{% endblock %}

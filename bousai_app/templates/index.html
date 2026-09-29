@@ -1,73 +1,192 @@
 {% extends "base.html" %}
 
-{% block content %}
-<!-- 避難所マップ -->
-<h2>避難所マップ</h2>
-<div id="shelterMap" style="height: 300px;"></div>
+{% block title %}ホーム | 防災アプリ{% endblock %}
 
-<!-- 気象警報・注意報 -->
-<h2>青森市 気象警報・注意報</h2>
-<p>10分おきに自動更新されます。</p>
-<div id="weatherContent">
-  <p>読み込み中...</p>
+{% block head %}
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        .home-content { width: min(875px, 100%); margin: 0 auto; }
+        .section-title { margin: 0 0 14px; color: #222; font-size: 24px; font-weight: 700; }
+        #shelterMap { width: 100%; height: 420px; background: #f7f8f9; }
+        #mapMessage { min-height: 1.5em; margin: 8px 0 0; color: #555; font-size: 14px; }
+        #mapCandidates { margin: 8px 0 0; padding-left: 24px; }
+        #mapCandidates li + li { margin-top: 6px; }
+        .weather-section { margin-top: 34px; }
+        .weather-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+        .weather-heading h2 { margin: 0; color: #2858a8; font-size: 22px; font-weight: 700; }
+        .weather-heading p { margin: 0; color: #289840; font-size: 14px; font-weight: 700; }
+        #weatherContent { margin-top: 22px; padding: 16px 18px; border: 1px solid #ddd; background: #f7f8f9; color: #333; font-size: 14px; line-height: 1.8; }
+        #weatherContent p { margin: 0 0 8px; }
+        #weatherContent p:last-child { margin-bottom: 0; }
+        .weather-status-clear { color: #289840; font-weight: 700; }
+        .weather-status-active { color: #d32f2f; font-weight: 700; }
+        .weather-status-error { color: #555; }
+        @media (max-width: 760px) {
+            .home-content { width: 100%; }
+            .weather-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+            .weather-heading h2 { font-size: 19px; }
+            #shelterMap { height: 350px; }
+        }
+    </style>
+{% endblock %}
+
+{% block content %}
+<div class="home-content">
+    <section aria-labelledby="map-title">
+        <h1 id="map-title" class="section-title">避難所マップ</h1>
+        <div id="shelterMap" aria-label="避難所周辺地図"></div>
+        <p id="mapMessage" aria-live="polite"></p>
+        <ul id="mapCandidates" aria-label="地図上の場所候補"></ul>
+        <a id="mapLocationLink" hidden>この避難所の位置を登録</a>
+    </section>
+
+    <section class="weather-section" aria-labelledby="weather-title">
+        <div class="weather-heading">
+            <h2 id="weather-title">青森市 気象警報・注意報</h2>
+            <p>10分おき自動更新</p>
+        </div>
+        <div id="weatherContent" aria-live="polite">
+            <p>気象情報を読み込んでいます...</p>
+        </div>
+    </section>
 </div>
 
-<!-- Leaflet の読み込み -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {
-    // 地図の初期化（藤沢市周辺を中心に設定）
-    const map = L.map('shelterMap').setView([35.3390, 139.4903], 12);
+    if (window.L) {
+        const map = L.map('shelterMap').setView([40.8222, 140.7474], 12);
+        const shelters = {{ shelters|tojson }};
+        const selectedShelterId = {{ selected_shelter_id|tojson }};
+        const mapMessage = document.getElementById('mapMessage');
+        const mapCandidates = document.getElementById('mapCandidates');
+        const mapLocationLink = document.getElementById('mapLocationLink');
+        let selectedShelterFound = false;
 
-    // OpenStreetMapタイルを追加
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors',
-        referrerPolicy: 'strict-origin-when-cross-origin'
-    }).addTo(map);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            referrerPolicy: 'strict-origin-when-cross-origin'
+        }).addTo(map);
 
-    // 気象警報・注意報の自動更新機能
+        async function showShelterCandidates(shelter) {
+            mapMessage.textContent = '地図上の場所候補を検索しています...';
+            try {
+                const response = await fetch(`/api/shelter_map_candidates/${encodeURIComponent(shelter.id)}`);
+                const candidates = await response.json();
+                if (!response.ok) throw new Error(candidates.error || '地図検索に失敗しました。');
+                if (candidates.length === 0) {
+                    mapMessage.textContent = '場所候補が見つかりませんでした。';
+                    return;
+                }
+
+                const markers = [];
+                candidates.forEach(candidate => {
+                    const position = [Number(candidate.latitude), Number(candidate.longitude)];
+                    if (!position.every(Number.isFinite)) return;
+                    const marker = L.marker(position).addTo(map);
+                    const popupContent = document.createElement('span');
+                    popupContent.textContent = candidate.display_name;
+                    marker.bindPopup(popupContent);
+                    markers.push(marker);
+
+                    const item = document.createElement('li');
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.textContent = candidate.display_name;
+                    button.addEventListener('click', function() {
+                        map.setView(position, 16);
+                        marker.openPopup();
+                        mapMessage.textContent = '候補の位置を表示中です。施設名と住所を確認してください。';
+                    });
+                    item.append(button);
+                    mapCandidates.append(item);
+                });
+
+                if (markers.length > 0) {
+                    map.setView(markers[0].getLatLng(), 14);
+                    markers[0].openPopup();
+                }
+                mapMessage.textContent = '位置情報未登録のため候補を表示しています。候補を選んで場所を確認してください。';
+            } catch (error) {
+                mapMessage.textContent = error.message || '地図検索に接続できませんでした。';
+            }
+        }
+
+        shelters.forEach(shelter => {
+            const latitude = Number(shelter.latitude);
+            const longitude = Number(shelter.longitude);
+            if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
+                || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+                if (String(shelter.id) === String(selectedShelterId)) {
+                    selectedShelterFound = true;
+                    mapMessage.textContent = `${shelter.name} は地図上の位置情報が登録されていません。`;
+                    mapLocationLink.href = `/shelter_location/${encodeURIComponent(shelter.id)}`;
+                    mapLocationLink.hidden = false;
+                    showShelterCandidates(shelter);
+                }
+                return;
+            }
+
+            const marker = L.marker([latitude, longitude]).addTo(map);
+            const popupContent = document.createElement('span');
+            popupContent.textContent = shelter.name;
+            marker.bindPopup(popupContent);
+            if (String(shelter.id) === String(selectedShelterId)) {
+                selectedShelterFound = true;
+                map.setView([latitude, longitude], 16);
+                marker.openPopup();
+                mapMessage.textContent = `${shelter.name} の場所を表示しています。`;
+            }
+        });
+
+        if (selectedShelterId && !selectedShelterFound) {
+            mapMessage.textContent = '指定された避難所が見つかりませんでした。';
+        }
+    }
+
     function updateWeatherWarnings() {
         fetch('/api/weather_warnings')
             .then(response => response.json())
             .then(data => {
-                console.log('気象情報を更新しました:', data);
                 updateWeatherContent(data);
             })
-            .catch(error => {
-                console.error('気象情報の更新に失敗しました:', error);
-            });
+                        .catch(() => updateWeatherContent({ error: true }));
     }
 
     function updateWeatherContent(data) {
-        const weatherContent = document.getElementById('weatherContent');
+                const weatherContent = document.getElementById('weatherContent');
+                weatherContent.replaceChildren();
 
-        if (data.error) {
-            weatherContent.innerHTML = '<p>気象情報の取得に失敗しました</p>';
-            return;
-        }
+                if (data.error) {
+            const message = document.createElement('p');
+                    message.className = 'weather-status-error';
+            message.textContent = '気象情報を取得できませんでした。';
+            weatherContent.append(message);
+                    return;
+                }
 
-        let warningsHtml = '';
-        if (data.warnings && data.warnings.length > 0) {
-            warningsHtml = '<ul>';
-            data.warnings.forEach(warning => {
-                warningsHtml += `<li>${warning.name}（${warning.status}）</li>`;
-            });
-            warningsHtml += '</ul>';
-        } else {
-            warningsHtml = '<p>現在、警報・注意報は発表されていません</p>';
-        }
+        const area = document.createElement('p');
+        area.textContent = data.area_name || '青森市';
+        weatherContent.append(area);
 
-        weatherContent.innerHTML = `
-            <p>対象地域: ${data.area_name || '青森市'}</p>
-            ${warningsHtml}
-            <p>最終確認: <span id="lastFetchTime">${data.last_fetch_time || '更新中...'}</span></p>
-            <p>気象庁最終発表: ${data.report_time || '不明'}</p>
-        `;
+        const status = document.createElement('p');
+        const hasWarnings = Array.isArray(data.warnings) && data.warnings.length > 0;
+        status.className = hasWarnings ? 'weather-status-active' : 'weather-status-clear';
+        status.textContent = hasWarnings
+            ? data.warnings.map(warning => `${warning.name}（${warning.status}）`).join('、')
+            : '現在、警報・注意報は発表されていません';
+        weatherContent.append(status);
+
+        const fetchedAt = document.createElement('p');
+        fetchedAt.textContent = `データ取得: ${data.last_fetch_time || '不明'}`;
+        weatherContent.append(fetchedAt);
+
+        const reportAt = document.createElement('p');
+        reportAt.textContent = `気象庁発表: ${data.report_time || '不明'}`;
+        weatherContent.append(reportAt);
     }
 
-    // 初回表示＋10分（600,000ミリ秒）おきに自動更新
     updateWeatherWarnings();
     setInterval(updateWeatherWarnings, 600000);
 });

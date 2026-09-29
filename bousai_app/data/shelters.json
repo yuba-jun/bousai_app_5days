@@ -1,14 +1,40 @@
 [
   {
     "id": 1,
-    "name": "御所見小学校"
+    "name": "御所見小学校",
+    "city": "藤沢市",
+    "district": "御所見地区",
+    "latitude": 35.40334253,
+    "longitude": 139.41660431
   },
   {
     "id": 2,
-    "name": "片瀬小学校"
+    "name": "片瀬小学校",
+    "city": "藤沢市",
+    "district": "片瀬地区",
+    "latitude": 35.31990579,
+    "longitude": 139.487595
   },
   {
     "id": 5,
-    "name": "鵠洋小学校"
+    "name": "鵠洋小学校",
+    "city": "藤沢市",
+    "district": "鵠沼地区",
+    "latitude": 35.32676943,
+    "longitude": 139.47505466
+  },
+  {
+    "id": 8,
+    "name": "あ"
+  },
+  {
+    "id": 9,
+    "name": "青い森セントラルパーク",
+    "city": "青森市",
+    "district": "",
+    "latitude": 40.8136331,
+    "longitude": 140.7469746,
+    "osm_type": "W",
+    "osm_id": 653750220
   }
 ]
