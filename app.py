@@ -643,6 +643,23 @@ def update_shelter_district(shelter_id):
     return redirect(url_for('search_results'))
 
 
+@app.route('/shelter_delete/<int:shelter_id>', methods=['POST'])
+@login_required
+def delete_shelter(shelter_id):
+    shelter = next((item for item in shelters if item.get('id') == shelter_id), None)
+    if shelter is None:
+        abort(404)
+
+    shelters.remove(shelter)
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(shelters, f, ensure_ascii=False, indent=2)
+
+    return_to = request.form.get('next', '')
+    if return_to and is_safe_url(return_to):
+        return redirect(return_to)
+    return redirect(url_for('all_shelters'))
+
+
 # 指示ボード：住民向けの指示を一覧で確認する
 @app.route('/board')
 @login_required

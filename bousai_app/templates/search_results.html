@@ -17,7 +17,15 @@
       <h3 id="district-{{ loop.index }}">{{ district }}</h3>
       <ul>
         {% for shelter in district_shelters %}
-          <li><a href="{{ url_for('index', shelter_id=shelter.id) }}#shelterMap">{{ shelter.name }}</a></li>
+          <li>
+            <a href="{{ url_for('index', shelter_id=shelter.id) }}#shelterMap">{{ shelter.name }}</a>
+            {% if session.logged_in %}
+              <form action="{{ url_for('delete_shelter', shelter_id=shelter.id) }}" method="post" onsubmit="return confirm('この避難所を削除します。よろしいですか？');">
+                <input type="hidden" name="next" value="{{ request.full_path }}">
+                <button type="submit">削除</button>
+              </form>
+            {% endif %}
+          </li>
           {% if session.logged_in and not shelter.district %}
             <li>
               <form action="{{ url_for('update_shelter_district', shelter_id=shelter.id) }}" method="post">
